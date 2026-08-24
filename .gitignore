@@ -7,3 +7,7 @@ __pycache__/
 verify_parquet.py
 check.py
 header-check.txt
+
+backend/.tmp/
+backend/scratch/
+duckdb_temp_storage*
