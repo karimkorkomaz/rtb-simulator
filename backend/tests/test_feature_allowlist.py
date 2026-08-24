@@ -130,8 +130,10 @@ class TestFeatureColumnsHardcodedSchema(unittest.TestCase):
 @unittest.skipUnless(
     (paths.PROCESSED_ROOT / "impressions").exists(),
     "backend/data/processed/impressions is git-ignored and not present on "
-    "a clean clone -- run `python -m src.ingest.ingest --sample` from "
-    "backend/ to generate it and enable this test.",
+    "a clean clone -- run `python -m src.ingest.ingest` (a real, non-sample "
+    "run) from backend/ to generate it and enable this test. Note: "
+    "`--sample` writes to backend/data/interim/sample/ instead (see "
+    "paths.output_root()), so it will NOT satisfy this skip condition.",
 )
 class TestFeatureColumnsRealParquetSchema(unittest.TestCase):
     """Requirement 3 (the real-schema half): read the actual column names

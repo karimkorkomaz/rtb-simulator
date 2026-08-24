@@ -14,6 +14,17 @@ see README.md "Where splitting/downsampling would slot in"), so there is no
 seed to fix for this stage; re-running is byte-for-byte idempotent given the
 same raw inputs, and files are skipped unless --overwrite is passed.
 
+--sample writes to a SEPARATE root (paths.SAMPLE_ROOT, i.e.
+backend/data/interim/sample/, mirroring the same <file_type_dir>/season=/
+date=/ layout), never to backend/data/processed/. This matters for two
+reasons: (1) a 20k-row sample file must never land at the same path as a
+real production partition -- if it did, the "skip if output exists" idempotency
+logic above would let a later full run treat that partition as already done
+and silently skip regenerating it, truncating the production dataset; (2) it
+keeps a sample run trivially safe to run against a partially- or
+fully-ingested production dataset with zero risk of touching it. See
+paths.output_root().
+
 Memory strategy: each raw file is read in fixed-size chunks via
 pandas.read_csv(..., compression="bz2", chunksize=...), transformed
 in-memory (transform.transform_chunk), and appended as a new Parquet
@@ -78,7 +89,7 @@ def discover_files(seasons: list[int], file_types: list[str]) -> list[dict]:
     return files
 
 
-def _output_path(file_type: str, season: int, date_str: str) -> Path:
+def _output_path(file_type: str, season: int, date_str: str, output_root: Path) -> Path:
     date_fmt = f"{date_str[0:4]}-{date_str[4:6]}-{date_str[6:8]}"
     # Partitioned by log type (top level -- these are structurally different
     # tables, not just a "date" split), then by season, then by date. Season
@@ -88,15 +99,25 @@ def _output_path(file_type: str, season: int, date_str: str) -> Path:
     # exceptions, see README.md) -- keeping season explicit in the path
     # makes it trivial to filter it out/in with a DuckDB/pyarrow predicate
     # without parsing dates.
-    out_dir = (paths.PROCESSED_ROOT / paths.FILE_TYPE_NAMES[file_type]
+    #
+    # `output_root` is caller-supplied (paths.output_root(sample), resolved
+    # once in main() and threaded through -- see ingest_file) rather than
+    # hardcoded to paths.PROCESSED_ROOT here, so a --sample run's paths land
+    # under paths.SAMPLE_ROOT instead and can never collide with, or trigger
+    # the skip-if-exists logic against, a real production partition file.
+    out_dir = (output_root / paths.FILE_TYPE_NAMES[file_type]
                / f"season={season}" / f"date={date_fmt}")
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / "part-0.parquet"
 
 
 def ingest_file(meta: dict, chunksize: int, sample_rows: int | None,
-                 overwrite: bool) -> dict:
-    out_path = _output_path(meta["file_type"], meta["season"], meta["date"])
+                 overwrite: bool, output_root: Path) -> dict:
+    # `output_root` is a plain pathlib.Path -- picklable, so this is safe to
+    # call as a ProcessPoolExecutor worker target (see main()'s --workers
+    # path): each worker receives its own copy of the same root rather than
+    # re-deriving --sample from anything global.
+    out_path = _output_path(meta["file_type"], meta["season"], meta["date"], output_root)
     if out_path.exists() and not overwrite:
         return {
             "path": str(meta["path"]), "out_path": str(out_path), "skipped": True,
@@ -206,6 +227,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     sample_rows = 20_000 if args.sample else None
+    # Single source of truth for "where does output go" -- see
+    # paths.output_root()'s docstring for why --sample must never resolve to
+    # PROCESSED_ROOT. A plain Path, so it's trivially picklable and safe to
+    # hand to ProcessPoolExecutor workers below (each worker computes its
+    # own output path from it independently, no shared state needed).
+    out_root = paths.output_root(args.sample)
 
     files = discover_files(args.season, args.file_type)
     if not files:
@@ -278,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
         for i, meta in enumerate(files, 1):
             print(f"[{i}/{len(files)}] {meta['path'].name} "
                   f"(season={meta['season']}, type={meta['file_type']})...", flush=True)
-            result = ingest_file(meta, args.chunksize, sample_rows, args.overwrite)
+            result = ingest_file(meta, args.chunksize, sample_rows, args.overwrite, out_root)
             log_rows.append(result)
             if result["skipped"]:
                 print("  skipped (output exists; use --overwrite to redo)")
@@ -289,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ingesting {len(files)} files with {args.workers} worker processes...")
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = {
-                pool.submit(ingest_file, meta, args.chunksize, sample_rows, args.overwrite): meta
+                pool.submit(ingest_file, meta, args.chunksize, sample_rows, args.overwrite, out_root): meta
                 for meta in files
             }
             for i, fut in enumerate(as_completed(futures), 1):
@@ -312,10 +339,15 @@ def main(argv: list[str] | None = None) -> int:
 
     total_rows_in = sum(r["rows_in"] for r in log_rows if r["rows_in"] is not None)
     total_rows_out = sum(r["rows_out"] for r in log_rows if r["rows_out"] is not None)
-    footprint = _dir_size_bytes(paths.PROCESSED_ROOT) if paths.PROCESSED_ROOT.exists() else 0
+    footprint = _dir_size_bytes(out_root) if out_root.exists() else 0
+    # Report the root actually written (PROCESSED_ROOT for a real run,
+    # SAMPLE_ROOT for --sample) -- printing a hardcoded "data/processed"
+    # label here regardless of --sample would misreport where a sample run's
+    # output actually landed.
+    footprint_label = out_root.relative_to(paths.DATA_ROOT).as_posix()
 
     print(f"\nDone in {elapsed:.1f}s. rows_in={total_rows_in} rows_out={total_rows_out}")
-    print(f"data/processed footprint: {footprint / 1e9:.2f} GB")
+    print(f"data/{footprint_label} footprint: {footprint / 1e9:.2f} GB")
     print(f"Row-count log: {log_path}")
     return 0
 

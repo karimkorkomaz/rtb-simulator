@@ -124,14 +124,23 @@ def impression_feature_relation(
     Raises `FileNotFoundError` if the impressions table hasn't been
     ingested yet (`data/processed/` is git-ignored and not present on a
     clean clone -- see backend/src/ingest/README.md to generate it).
+
+    Note: `ingest.py --sample` writes to a separate root
+    (`paths.SAMPLE_ROOT`, i.e. `data/interim/sample/`), not
+    `data/processed/` -- see `paths.output_root()`. This function defaults
+    to `paths.PROCESSED_ROOT` and does not read `--sample` output unless a
+    caller explicitly passes `processed_root=paths.SAMPLE_ROOT` (or
+    `paths.output_root(sample=True)`).
     """
     imp_root = _impressions_root(processed_root)
     if not imp_root.exists():
         raise FileNotFoundError(
             f"{imp_root} does not exist -- run "
             "`backend\\.venv\\Scripts\\python.exe -m src.ingest.ingest` "
-            "(or `--sample` for a fast dev subset) from backend/ first. "
-            "See backend/src/ingest/README.md."
+            "from backend/ first (a real, non-sample run: --sample writes "
+            "to data/interim/sample/, not data/processed/ -- pass "
+            "`processed_root=paths.SAMPLE_ROOT` explicitly if that's what "
+            "you want to read instead). See backend/src/ingest/README.md."
         )
     clk_root = _clicks_root(processed_root)
     imp_glob = str(imp_root / "**" / "*.parquet")
