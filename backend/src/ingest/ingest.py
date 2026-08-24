@@ -231,14 +231,33 @@ def main(argv: list[str] | None = None) -> int:
         "expected_logtype": schema.EXPECTED_LOGTYPE,
         "null_literals": sorted(schema.NULL_LITERALS),
         "empty_string_is_null_columns": sorted(schema.EMPTY_STRING_IS_NULL_COLUMNS),
-        "feature_denylist": sorted(schema.FEATURE_DENYLIST),
-        "feature_denylist_rationale": (
-            "bidprice: fixed data-collection strategy per README (with "
-            "season-3 exceptions, see validation_report.json "
-            "bidprice_by_advertiser); bidid: row identifier, not "
-            "predictive; payprice: this is the win-price label, not an "
-            "input feature."
+        # The feature allowlist itself (schema.feature_columns() applied to
+        # BID_COLUMNS -- i.e. what a caller gets if every bid column is
+        # present and no hash companions are involved), plus the two
+        # distinct exclusion mechanisms that produce it, so this manifest
+        # documents what IS usable, not just what's forbidden. See
+        # schema.py's "Feature allowlist" section for the full rationale.
+        "feature_allowlist": schema.feature_columns(list(schema.BID_COLUMNS)),
+        "non_feature_bid_columns": sorted(schema.NON_FEATURE_BID_COLUMNS),
+        "non_feature_bid_columns_rationale": (
+            "bidid: row identifier, not predictive. bidprice: present at "
+            "bid-request time (so NOT structurally excluded like "
+            "logtype/payprice/keypage below), but excluded explicitly -- "
+            "it is a fixed data-collection strategy set by the logging "
+            "campaign (with season-3 exceptions, see validation_report.json "
+            "bidprice_by_advertiser), not a live bidding decision; training "
+            "on it means learning against a collection knob."
         ),
+        "structurally_excluded_columns": sorted(schema._BID_LOG_DROPPED),
+        "structurally_excluded_columns_rationale": (
+            "logtype, payprice, keypage are absent from BID_COLUMNS itself "
+            "(not from an exclusion list) because none of the three are "
+            "observable at bid-request time, for any model scoring a bid "
+            "request -- a bid-log row is written before the auction "
+            "resolves. This is enforced by construction: they cannot become "
+            "features without first being added to BID_COLUMNS."
+        ),
+        "partition_key_columns": sorted(schema.PARTITION_KEY_COLUMNS),
         "high_cardinality_hash_fields": schema.HIGH_CARDINALITY_HASH_FIELDS,
         "hash_buckets": schema.HASH_BUCKETS,
         "hash_seed": schema.HASH_SEED,

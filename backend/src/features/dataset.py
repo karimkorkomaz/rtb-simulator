@@ -1,0 +1,228 @@
+"""
+The single sanctioned entry point for loading CTR-modelling features out of
+the ingested `impressions` Parquet table.
+
+Nothing else in this codebase should read `data/processed/impressions/`
+directly for modelling purposes -- go through
+`load_impression_features()` (or `impression_feature_relation()` for the
+lazy/streaming variant) so the feature/non-feature boundary enforced by
+`ingest.schema.feature_columns()` is applied every single time, with no way
+to route around it.
+
+WHY THIS MODULE EXISTS (see the methodology audit that prompted it): before
+this module, there was no loader at all in `backend/src/` -- only the
+`ingest` package that writes Parquet. Any modelling code would have had to
+invent its own "drop these columns" logic, exactly the pattern
+(`df.drop(columns=[...])`) that silently reintroduces a leaking column the
+moment someone forgets to update the drop-list. This module makes that
+impossible by construction: there is no parameter here that accepts an
+arbitrary column list and skips `schema.feature_columns()` -- see
+`_resolve_feature_columns()` below.
+
+LABEL CONSTRUCTION: the `impressions` table has no `click` column (clicks
+are a separate table, `data/processed/clicks/`, joined here on `bidid`).
+The join deliberately projects ONLY `bidid` from the clicks side
+(`LEFT JOIN (SELECT DISTINCT bidid FROM clicks) c USING (bidid)`, label =
+`CASE WHEN c.bidid IS NULL THEN 0 ELSE 1 END`) rather than
+`SELECT * FROM clicks`. Every non-key column on the clicks table
+(timestamp, useragent, IP, ... -- the same 24-column layout as
+impressions, see ingest/schema.py) is non-null if and only if a click
+happened, for the trivial reason that a clicks-table row only exists when
+a click happened. Joining any of those columns in would therefore leak the
+label back in as an apparently-innocuous feature-shaped column, under any
+name. Projecting only the join key avoids that entirely, structurally,
+rather than relying on remembering not to `SELECT *` a clicks join.
+
+MEMORY: the impressions table is ~15.4M rows. Both entry points here build
+a DuckDB relation (`impression_feature_relation`) that pushes projection
+(only admitted feature columns), the season filter, and any `row_limit`
+down to the Parquet scan -- nothing is materialized in Python until (and
+unless) `.load_impression_features()` (or a caller's own `.df()` call) is
+invoked, and DuckDB streams/query-plans the read rather than pandas
+full-loading the files. `row_limit` exists specifically so tests and dev
+iteration can work with a handful of rows in milliseconds instead of
+minutes -- see `--sample` in `ingest.py` for the equivalent idea at the
+ingestion stage. Materializing the *entire* table (no row_limit, no
+`columns` restriction) is possible but is the caller's explicit choice, not
+this module's default recommendation for anything other than a machine
+with enough RAM to hold it.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable, Optional
+
+import duckdb
+import pandas as pd
+
+from ..ingest import paths, schema
+
+LABEL_COLUMN = "click"
+
+
+def _impressions_root(processed_root: Optional[Path]) -> Path:
+    return (processed_root or paths.PROCESSED_ROOT) / "impressions"
+
+
+def _clicks_root(processed_root: Optional[Path]) -> Path:
+    return (processed_root or paths.PROCESSED_ROOT) / "clicks"
+
+
+def _resolve_feature_columns(
+    available_columns: list[str], requested: Optional[Iterable[str]]
+) -> list[str]:
+    """Intersect a caller's requested column subset with the allowlist.
+
+    This is the ONLY place a caller can narrow the column set, and it is
+    NOT a passthrough: `available_columns` (the real columns of the
+    Parquet dataset being read) is always run through
+    `schema.feature_columns()` first, and a `requested` name that survives
+    that filter is the only kind of name that can appear in the output.
+    Asking for a column outside the allowlist (e.g. `payprice`, or a typo)
+    raises rather than being silently ignored -- consistent with
+    `feature_columns()`'s own fail-closed behaviour.
+    """
+    admitted = schema.feature_columns(available_columns)
+    if requested is None:
+        return admitted
+    requested = list(requested)
+    admitted_set = set(admitted)
+    outside = sorted(set(requested) - admitted_set)
+    if outside:
+        raise ValueError(
+            f"load_impression_features(): requested column(s) {outside!r} "
+            "are not in the feature allowlist (schema.feature_columns()) "
+            "-- refusing to select them. There is no bypass for arbitrary "
+            "column selection in this module."
+        )
+    # Preserve the allowlist's (i.e. BID_COLUMNS-derived) order rather than
+    # the caller's requested order, so output column order is stable and
+    # independent of how `columns` happened to be written.
+    requested_set = set(requested)
+    return [c for c in admitted if c in requested_set]
+
+
+def impression_feature_relation(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    seasons: Iterable[int] = (2, 3),
+    columns: Optional[Iterable[str]] = None,
+    row_limit: Optional[int] = None,
+    processed_root: Optional[Path] = None,
+) -> tuple[duckdb.DuckDBPyRelation, list[str]]:
+    """Build (but do not materialize) the DuckDB relation for CTR features
+    + label, over the `impressions` table joined against `clicks`.
+
+    Returns `(relation, feature_columns)`: `relation` has one column per
+    admitted feature plus a trailing `click` (0/1) label column;
+    `feature_columns` is the exact ordered list of feature column names (so
+    a caller doesn't have to re-derive "all columns except the label").
+    Nothing is read from disk until the caller calls `.df()` / `.arrow()` /
+    `.fetchall()` etc. on the returned relation, or until
+    `load_impression_features()` (below) does so for them.
+
+    Raises `FileNotFoundError` if the impressions table hasn't been
+    ingested yet (`data/processed/` is git-ignored and not present on a
+    clean clone -- see backend/src/ingest/README.md to generate it).
+    """
+    imp_root = _impressions_root(processed_root)
+    if not imp_root.exists():
+        raise FileNotFoundError(
+            f"{imp_root} does not exist -- run "
+            "`backend\\.venv\\Scripts\\python.exe -m src.ingest.ingest` "
+            "(or `--sample` for a fast dev subset) from backend/ first. "
+            "See backend/src/ingest/README.md."
+        )
+    clk_root = _clicks_root(processed_root)
+    imp_glob = str(imp_root / "**" / "*.parquet")
+    clk_glob = str(clk_root / "**" / "*.parquet")
+
+    # DESCRIBE reads only Parquet footers/schema, not row data -- cheap
+    # even though the dataset is 15.4M rows, and gives us the real column
+    # list to run through feature_columns() rather than hand-maintaining a
+    # duplicate of transform.output_schema() here.
+    schema_cols = [
+        row[0]
+        for row in con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{imp_glob}', hive_partitioning=1)"
+        ).fetchall()
+    ]
+    feature_cols = _resolve_feature_columns(schema_cols, columns)
+
+    season_list = [int(s) for s in seasons]
+    if not season_list:
+        raise ValueError("impression_feature_relation(): `seasons` must be non-empty.")
+    season_filter = "WHERE i.season IN (" + ", ".join(str(s) for s in season_list) + ")"
+
+    select_cols = ", ".join(f'i."{c}"' for c in feature_cols)
+    limit_clause = f"LIMIT {int(row_limit)}" if row_limit is not None else ""
+
+    # Label: see module docstring -- only `bidid` is ever projected from
+    # the clicks side of the join, by construction, so no clicks-table
+    # column (which would be non-null iff click == 1) can leak through
+    # here under any name.
+    query = f"""
+        SELECT {select_cols},
+               CASE WHEN c.bidid IS NULL THEN 0 ELSE 1 END AS "{LABEL_COLUMN}"
+        FROM read_parquet('{imp_glob}', hive_partitioning=1) i
+        LEFT JOIN (
+            SELECT DISTINCT bidid FROM read_parquet('{clk_glob}', hive_partitioning=1)
+        ) c USING (bidid)
+        {season_filter}
+        {limit_clause}
+    """
+    return con.execute(query), feature_cols
+
+
+def load_impression_features(
+    *,
+    seasons: Iterable[int] = (2, 3),
+    columns: Optional[Iterable[str]] = None,
+    row_limit: Optional[int] = None,
+    processed_root: Optional[Path] = None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Materialize CTR features + label as `(X, y)`.
+
+    `X` is a `pandas.DataFrame` of admitted feature columns only -- never
+    `click`, `bidid`, `bidprice`, `payprice`, `logtype`, `keypage`, or any
+    Hive partition key -- so callers never need `df.drop(columns=[...])`
+    to separate the label (the exact pattern the methodology audit flagged
+    as unsafe: it silently keeps everything not explicitly named). `y` is a
+    `pandas.Series` named `"click"`, 0/1, aligned to `X`'s row order.
+
+    `row_limit` and/or a narrow `seasons` selection should be used for
+    tests and interactive dev work -- see the module docstring's "MEMORY"
+    section for why materializing the full ~15.4M-row table is a real,
+    deliberate choice rather than this function's default use case.
+
+    Downsampling negatives and the temporal train/val/test split are
+    NOT performed here -- this function returns the full (season-filtered)
+    row set as-is. That is a separate, explicitly-configured stage
+    downstream (see ingest/README.md "Where train/val/test splitting and
+    downsampling would slot in"): this loader's only job is "raw columns
+    -> admitted features + label", not modelling-stage sampling decisions.
+    """
+    con = duckdb.connect()
+    relation, feature_cols = impression_feature_relation(
+        con,
+        seasons=seasons,
+        columns=columns,
+        row_limit=row_limit,
+        processed_root=processed_root,
+    )
+    table = relation.fetch_arrow_table()
+    df = table.to_pandas()
+    y = df.pop(LABEL_COLUMN)
+    y.name = LABEL_COLUMN
+    # Defensive, cheap check (not a full re-validation): the query above is
+    # the only place columns are selected, so this should be tautological,
+    # but a silent mismatch here would be exactly the kind of "a future
+    # column became a feature without anyone deciding that" bug this whole
+    # module exists to prevent -- assert it stays true rather than trusting it.
+    assert list(df.columns) == feature_cols, (
+        "load_impression_features(): materialized columns "
+        f"{list(df.columns)!r} do not match the resolved feature column "
+        f"list {feature_cols!r} -- this indicates a bug in the query "
+        "construction above, not a data problem."
+    )
+    return df, y

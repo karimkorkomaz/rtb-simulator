@@ -166,7 +166,7 @@ pipeline.** From the dataset README, section 2:
 `bidprice` is therefore a data-collection artefact — a knob turned up high
 so enough impressions/paying-prices would be observed — not a modelled
 bidding decision, and not iPinYou's real live-bidding-algorithm output.
-Consequences enforced structurally in this codebase, not just documented:
+Consequences:
 
 - `bidprice` **must not** be used as a model feature.
 - `bidprice` **must not** be used as a baseline bidding policy to benchmark
@@ -176,14 +176,63 @@ Consequences enforced structurally in this codebase, not just documented:
   rate at the fixed price, or checking the README's season-3-exceptions
   claim, see below).
 
-The structural enforcement is `schema.FEATURE_DENYLIST` (currently
-`{bidprice, bidid, payprice}` — `bidid` is a row identifier with no
-predictive content, `payprice` is excluded because it is the win-price
-*label* this dataset exists to study, not an input feature) and
-`schema.feature_columns()`, the single sanctioned way to go from "all
-Parquet columns" to "candidate model features." Any future modelling code
-that does something like `df.columns.difference({"click"})` instead of
-calling `feature_columns()` is doing it wrong, and reviewers should flag it.
+### How this is actually enforced: an allowlist derived from `BID_COLUMNS`, not a denylist
+
+The mechanism is `schema.feature_columns()`, the single sanctioned way to go
+from "columns present in a Parquet table" to "candidate CTR-model
+features." It is **not** a hand-maintained list of forbidden names (an
+earlier version of this pipeline used a `FEATURE_DENYLIST` set for this,
+which has been removed — a denylist means every *future* column is a
+feature by default, and exact-name matching is trivially defeated by a
+rename or a join suffix like `payprice_1`). The rule now is:
+
+> A column is a candidate CTR feature iff it is present in `BID_COLUMNS`
+> (the columns genuinely knowable at bid-request time — see "The
+> empirically discovered bid-log schema" above), minus
+> `schema.NON_FEATURE_BID_COLUMNS`, an explicit, documented exception set.
+
+This makes the exclusion of `logtype`, `payprice`, and `keypage` **structural**:
+they are absent from `BID_COLUMNS` itself (a bid-log row is written before
+the auction resolves, so none of the three exist yet — see above), so
+nobody has to remember to list them anywhere, and they cannot silently
+reappear as features without first being added to `BID_COLUMNS`, which is a
+much louder, more visible change than editing an exclusion list.
+
+`bidprice`, by contrast, genuinely **is** present in the bid log — iPinYou
+submits its own bid before the auction runs, so it's known at bid-request
+time and does *not* fall out of `BID_COLUMNS` structurally. It therefore
+needs, and gets, an **explicit** exclusion:
+`schema.NON_FEATURE_BID_COLUMNS = {"bidid", "bidprice"}` (`bidid` is a row
+identifier with no predictive content; `bidprice` is the fixed
+data-collection strategy described above — a collection knob, not a live
+bidding decision). `feature_columns()` also recognises the Hive partition
+keys (`season`, `date`) as known-but-not-features, and admits a `<base>_hash`
+companion column (e.g. `ipinyouid_hash`) iff `<base>` is admitted — which is
+what makes `keypage_hash` excluded automatically too, with no name-based
+special case, since `keypage` isn't in `BID_COLUMNS`. Any column
+`feature_columns()` doesn't recognise at all (an unlisted new field, a
+join-suffixed rename like `payprice_1`, a manual rename like `pay_price`)
+raises immediately rather than being silently dropped or silently admitted
+— see `backend/src/ingest/schema.py` and
+`backend/tests/test_feature_allowlist.py` for the enforced behaviour and its
+test coverage. `backend/src/features/dataset.py` is the loader that calls
+`feature_columns()` internally with no `columns=`/`select_all` bypass; any
+future modelling code that does something like
+`df.columns.difference({"click"})` instead of using that loader (or calling
+`feature_columns()` directly) is doing it wrong, and reviewers should flag it.
+
+**One caveat, so this isn't overclaimed:** `bidprice` is exactly recoverable
+from `(advertiser, adexchange)` in this dataset — the season-3-exceptions
+analysis below shows there is exactly one distinct `bidprice` per
+`(season, advertiser, adexchange)` group, zero exceptions, across all 9
+training campaigns — and both `advertiser` and `adexchange` are legitimate,
+admitted bid-time features. So excluding `bidprice` itself is **modelling
+hygiene, not an information-theoretic guarantee**: nothing stops a model
+from reconstructing the same signal via `advertiser`/`adexchange`, which is
+expected and fine (those two are real bid-time features in their own
+right) — what the exclusion prevents is the *appearance* of using a
+per-request bidding decision as a feature when no such decision exists in
+this data.
 
 ### Season-3 exceptions: what "variable `bidprice`" actually means in this data
 
@@ -391,8 +440,14 @@ ingestion-stage fix).
 
 ## Where train/val/test splitting and downsampling would slot in
 
-Deliberately **not** built in this task (ingestion only). For the next
-stage:
+Deliberately **not** built in this task (ingestion only). `backend/src/features/dataset.py`
+(`load_impression_features()` / `impression_feature_relation()`) exists as
+the sanctioned loader that turns the ingested `impressions` table into
+`(X, y)` — features via `schema.feature_columns()`, label via a
+key-only join against `clicks` (see that module's docstring for why the
+join projects *only* `bidid` from the clicks side) — but it does not itself
+split or downsample; it hands back the full (season-filtered) row set. For
+the next stage:
 
 - **Temporal split, never random:** `timestamp` is already a proper
   `datetime64[us]` column in the Parquet output, partitioned by

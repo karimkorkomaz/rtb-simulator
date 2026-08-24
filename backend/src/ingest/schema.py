@@ -58,7 +58,7 @@ IMP_CLK_CONV_COLUMNS: list[str] = [
     "creative",        # 19 creative id
     "bidprice",        # 20 iPinYou's own submitted bid, RMB fen. FIXED
                        #    data-collection strategy in most campaigns, NOT a
-                       #    live bidding decision -- see FEATURE DENYLIST below.
+                       #    live bidding decision -- see NON_FEATURE_BID_COLUMNS below.
     "payprice",        # 21 winning/settlement price, RMB fen -- the real
                        #    auction-economics signal this dataset is used for
     "keypage",         # 22 landing/key page id, "null" if not applicable
@@ -108,48 +108,6 @@ NULL_LITERALS = {"null"}
 EMPTY_STRING_IS_NULL_COLUMNS = {"urlid", "keypage", "usertag", "domain", "url"}
 
 # ---------------------------------------------------------------------------
-# Feature allowlist / denylist -- the structural enforcement of the
-# methodological constraint that `bidprice` must never be used as a feature
-# or a baseline policy.
-#
-# WHY: the dataset README states the campaigns were run "with a fixed
-# relatively high-price bidding strategy ... for the purpose of getting
-# enough impressions and their paying prices", explicitly different from
-# iPinYou's live bidding algorithm. bidprice is therefore a data-collection
-# artefact, not a modelled decision -- training on it or benchmarking a
-# policy against it would be learning/measuring against a constant (or a
-# collection knob), not a real bidding strategy.
-#
-# It is NOT dropped from the Parquet output -- it's needed to reconstruct
-# exactly what was collected (e.g. to compute win rate at the fixed price,
-# or to identify the season-3 exceptions below) -- but it must never be
-# silently picked up by a "select all columns as features" step downstream.
-# Any such step MUST go through `feature_columns()` below rather than doing
-# `df.columns.difference({"target"})` or similar.
-# ---------------------------------------------------------------------------
-
-FEATURE_DENYLIST = frozenset({
-    "bidprice",  # fixed data-collection strategy, see docstring above -- not
-                 # a real bidding decision, must not be a feature or baseline
-    "bidid",     # row identifier, not predictive
-    "payprice",  # this is the auction outcome / label for win-price modelling,
-                 # not an input feature -- including it would leak the target
-})
-
-
-def feature_columns(all_columns: list[str]) -> list[str]:
-    """Return `all_columns` with the denylisted columns structurally removed.
-
-    This is the ONLY sanctioned way to go from "all columns in the Parquet
-    file" to "candidate model features" in this codebase. Downstream
-    modelling code should import and call this rather than re-deriving the
-    same exclusion list, so `bidprice` cannot be accidentally reintroduced
-    by a future "just select everything" shortcut.
-    """
-    return [c for c in all_columns if c not in FEATURE_DENYLIST]
-
-
-# ---------------------------------------------------------------------------
 # High-cardinality categorical handling
 #
 # WHY hashing rather than frequency-based bucketing: frequency-based
@@ -174,6 +132,10 @@ def feature_columns(all_columns: list[str]) -> list[str]:
 # (region, city, adexchange, slotvisibility, slotformat, advertiser,
 # logtype) are left as plain categorical strings -- their dictionaries are
 # cheap and lossless, hashing them would only destroy information.
+#
+# NOTE: this section is declared BEFORE the feature allowlist below because
+# `feature_columns()` needs HIGH_CARDINALITY_HASH_FIELDS to recognise
+# `<base>_hash` companion columns generically (see there).
 # ---------------------------------------------------------------------------
 
 HIGH_CARDINALITY_HASH_FIELDS = [
@@ -187,3 +149,167 @@ LOW_CARDINALITY_CATEGORY_FIELDS = [
     "region", "city", "adexchange", "slotvisibility", "slotformat",
     "advertiser", "logtype",
 ]
+
+# ---------------------------------------------------------------------------
+# Feature allowlist -- the structural enforcement that a column must be
+# knowable at bid-request time (and not otherwise excluded for a distinct,
+# documented reason) before `feature_columns()` will hand it out as a
+# candidate CTR-model feature.
+#
+# RULE: a column is a candidate CTR feature iff it is a member of
+# BID_COLUMNS (the columns present in the bid log -- see the module
+# docstring and `_BID_LOG_DROPPED` above), minus NON_FEATURE_BID_COLUMNS
+# below. This is an ALLOWLIST *derived from* BID_COLUMNS -- not a
+# hand-maintained second list of names, and not a denylist. That
+# distinction is the entire point of this section:
+#
+#   * `logtype`, `payprice`, `keypage` are excluded STRUCTURALLY. They are
+#     simply absent from BID_COLUMNS -- a bid-log row is written when the
+#     bid request is sent, before any auction resolves, so none of the
+#     three exist yet at that point (see the module docstring). Nobody has
+#     to remember to list them here, and a future edit cannot silently
+#     re-admit them without also re-adding them to BID_COLUMNS itself,
+#     which is a much louder, more visible change (it would also affect
+#     ingest.py/transform.py's bid-log handling, not just this function).
+#     In particular: `payprice` is excluded here because it is not
+#     observable at bid-request time for ANY model scoring a bid request --
+#     not because "it is the label" for some particular modelling task.
+#     A win-price-modelling script has its own, task-specific reasons to
+#     treat `payprice` as its target; that is a decision for that script to
+#     make explicitly, not something this shared allowlist should encode
+#     by baking in one task's framing.
+#
+#   * `bidprice`, by contrast, genuinely IS present in the bid log -- it is
+#     known at bid-request time (iPinYou submits its own bid before the
+#     auction runs) -- so it does NOT fall out of BID_COLUMNS structurally.
+#     It needs an EXPLICIT exclusion, with its own distinct rationale (see
+#     NON_FEATURE_BID_COLUMNS below): the dataset README documents that
+#     campaigns were run "with a fixed relatively high-price bidding
+#     strategy ... for the purpose of getting enough impressions and their
+#     paying prices", different from iPinYou's live bidding algorithm --
+#     i.e. bidprice is a fixed data-collection knob set by the logging
+#     campaign, not a live per-request bidding decision. Training a CTR
+#     model on it would mean learning against a collection artefact, not a
+#     real bidding signal. (It is exactly recoverable from
+#     `(advertiser, adexchange)` in this dataset -- see README.md -- so its
+#     exclusion is modelling hygiene, not an information-theoretic
+#     guarantee: nothing stops a caller from using `advertiser` and
+#     `adexchange`, both legitimately bid-time features, to reconstruct it.)
+#
+# `bidprice` is NOT dropped from the Parquet output -- it's needed to
+# reconstruct exactly what was collected (e.g. to compute win rate at the
+# fixed price) -- but it must never be silently picked up by a "select all
+# columns as features" step downstream. Any such step MUST go through
+# `feature_columns()` below rather than doing
+# `df.columns.difference({"click"})` or similar.
+# ---------------------------------------------------------------------------
+
+NON_FEATURE_BID_COLUMNS = frozenset({
+    "bidid",     # row identifier, not predictive
+    "bidprice",  # fixed data-collection strategy, present at bid-request
+                 # time but excluded on modelling-hygiene grounds -- see the
+                 # block comment above for the full rationale
+})
+
+# The Hive-style partition keys baked into the output directory structure
+# (`season=.../date=...`, see ingest.py::_output_path). These surface as
+# columns when the Parquet dataset is read back via DuckDB/pyarrow
+# partition discovery, so `feature_columns()` must recognise them
+# explicitly as "known, and known not to be a feature" rather than letting
+# them trip the fail-closed check below -- they are metadata about *where*
+# a row was written, not something known at bid-request time in the sense
+# BID_COLUMNS is.
+PARTITION_KEY_COLUMNS = frozenset({"season", "date"})
+
+# Derived once at import time: BID_COLUMNS minus the explicit non-feature
+# set. This -- not FEATURE_DENYLIST, which no longer exists -- is the
+# actual allowlist. Recomputing it from BID_COLUMNS means a future change
+# to BID_COLUMNS (e.g. if the bid-log schema is ever found to include a
+# column that was previously missed) automatically flows through here
+# without a second edit.
+_ALLOWED_FEATURE_COLUMNS = frozenset(BID_COLUMNS) - NON_FEATURE_BID_COLUMNS
+
+
+def feature_columns(all_columns: list[str]) -> list[str]:
+    """The ONLY sanctioned way to go from "columns present in the Parquet
+    output" to "candidate CTR-model features" in this codebase.
+
+    A column is admitted iff it is in BID_COLUMNS (i.e. genuinely knowable
+    at bid-request time) and not in NON_FEATURE_BID_COLUMNS (excluded for
+    an explicit, documented, non-structural reason). A `<base>_hash`
+    companion column (see HIGH_CARDINALITY_HASH_FIELDS / transform.py) is
+    admitted iff `<base>` would be admitted -- e.g. `keypage_hash` is
+    excluded automatically because `keypage` is not in BID_COLUMNS, with no
+    name-based special case required.
+
+    Callers are expected to pass the FULL column list of whatever table
+    they read (e.g. the `impressions` table, which -- unlike the bid log --
+    genuinely does contain `logtype`/`payprice`/`keypage`, since those are
+    only absent from bid-log rows). Those three are recognised as legitimate
+    columns of the known iPinYou schema (IMP_CLK_CONV_COLUMNS) that simply
+    fall outside BID_COLUMNS, and are therefore excluded silently -- exactly
+    like `keypage_hash` above, this requires no name-based listing anywhere:
+    they are structurally absent from BID_COLUMNS and structurally present
+    in IMP_CLK_CONV_COLUMNS, and that's the entire test.
+
+    Fails CLOSED, not open: any input column that is not a member of the
+    known universe -- IMP_CLK_CONV_COLUMNS, a `<base>_hash` companion of a
+    HIGH_CARDINALITY_HASH_FIELDS entry, or a PARTITION_KEY_COLUMNS entry --
+    raises immediately, rather than being silently dropped (which would
+    hide a real bug -- e.g. a typo'd column name never making it into the
+    feature set) or silently kept (which would recreate the exact failure
+    mode this replaces: a denylist where every new/renamed/joined column is
+    a feature by default). This is what rejects join-suffix or rename bugs
+    such as `payprice_1`, `timestamp_1`, or a manually renamed `pay_price`
+    -- none of those exact strings are members of IMP_CLK_CONV_COLUMNS, so
+    all three raise rather than silently passing through. Adding any
+    genuinely new column to the pipeline therefore forces a conscious,
+    reviewable decision: it belongs in IMP_CLK_CONV_COLUMNS/BID_COLUMNS (if
+    it's a real column of the source schema); or it belongs in
+    NON_FEATURE_BID_COLUMNS / PARTITION_KEY_COLUMNS with a documented
+    reason; or it is not allowed to come out of this function at all.
+    """
+    features: list[str] = []
+    unrecognised: list[str] = []
+    for col in all_columns:
+        if col in PARTITION_KEY_COLUMNS:
+            continue  # metadata about where a row was written, not a feature
+
+        base = col[: -len("_hash")] if col.endswith("_hash") else None
+        if base is not None and base in HIGH_CARDINALITY_HASH_FIELDS:
+            if base in _ALLOWED_FEATURE_COLUMNS:
+                features.append(col)
+            # else: `base` itself is not an admissible feature (e.g.
+            # `keypage` is absent from BID_COLUMNS -- a post-auction
+            # field), so its hash companion `keypage_hash` is excluded the
+            # same way. This branch is generic over ANY `<base>_hash`
+            # column, not a `keypage_hash`-specific special case.
+            continue
+
+        if col in NON_FEATURE_BID_COLUMNS:
+            continue  # explicit exclusion, e.g. bidprice -- see block comment above
+
+        if col in _ALLOWED_FEATURE_COLUMNS:
+            features.append(col)
+            continue
+
+        if col in IMP_CLK_CONV_COLUMNS:
+            # A real column of the source schema (logtype/payprice/keypage
+            # are the only ones that land here) that is structurally absent
+            # from BID_COLUMNS -- excluded silently, same mechanism as
+            # above, no name-based listing required. See module docstring.
+            continue
+
+        unrecognised.append(col)
+
+    if unrecognised:
+        raise ValueError(
+            f"feature_columns(): unrecognised column(s) {sorted(unrecognised)!r} -- "
+            "refusing to guess whether they're safe to use as CTR-model "
+            "features. Add each one to schema.IMP_CLK_CONV_COLUMNS/"
+            "BID_COLUMNS (if it's a genuine column of the source schema) "
+            "or to schema.NON_FEATURE_BID_COLUMNS / "
+            "schema.PARTITION_KEY_COLUMNS (with a documented, reviewable "
+            "reason) before it can be selected here."
+        )
+    return features
