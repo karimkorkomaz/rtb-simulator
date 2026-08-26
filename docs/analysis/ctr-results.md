@@ -176,21 +176,62 @@ Full rationale in `backend/src/modeling/features_lr.py`'s module docstring; summ
 The full-data validation AUC (0.930) is high enough to warrant investigation before reporting, per
 protocol ("an unexpectedly high AUC is a bug until proven otherwise"). Two checks:
 
-**1. Feature ablation** (2M-row train sample / 800K-row val sample, same pipeline, `C=1.0`):
+**1. Feature ablation.** Two runs of the same 4-variant ablation exist, at different scale/`C`
+combinations, and they are **not interchangeable**:
 
-| feature set | AUC |
-|---|---:|
-| full field set | 0.810 |
-| drop `ipinyouid` | 0.812 |
-| drop `ipinyouid`, `useragent`, `IP` (all identity-ish fields) | 0.809 |
-| drop **all** high-cardinality fields (`domain, url, slotid, creative, useragent, IP, ipinyouid`) | 0.743 |
+- **Sampled run** (2M-row train sample / 800K-row val sample, same pipeline, `C=1.0`) -- the
+  original investigation, run before the full `C`-sweep in "Results" below had settled on the
+  selected `C=0.1`. Its headline "full field set" AUC of **0.810** was a **scale artifact**: a
+  2M-row sample at `C=1.0`, differing from the reported baseline (0.9299) in *two* ways at once
+  (row count: 2M vs. the full ~8.8M-row train split; regularization: `C=1.0` vs. the selected
+  `C=0.1`). **0.810 is not comparable to the reported baseline and should not be read as a
+  regression from it** -- it is superseded by the full-scale run below, which fixes both axes.
+- **Full-scale run** (`backend/data/metadata/ctr_lr_ablation_fullscale_season2.json`; full train,
+  full val, `C=0.1` -- the same scale and the same `C` as the reported baseline): the current,
+  comparable version of this ablation, reported here.
 
-Removing user/device identity fields (`ipinyouid`, `useragent`, `IP`) changes AUC by less than
-0.003 -- ruling out "the model is just memorizing which user/device clicked" as the driver.
-Removing **all** high-cardinality fields (including placement/campaign identifiers `domain`,
-`slotid`, `creative`, `url`) drops AUC by ~0.07. This isolates the signal to
-**placement/campaign-level heterogeneity** (some ad slots, creatives, and domains have
-structurally different baseline CTR), not user-identity leakage.
+Run provenance (from the JSON): train `2013-06-06..2013-06-10`, val `2013-06-11` (identical to the
+baseline's split boundaries), negative downsampling `negative_sampling_rate=0.02`, `seed=42`,
+`n_positive=6,080`, `n_negative_true=8,827,947`, `n_negative_sampled=176,559` -- the exact same
+downsampling config already recorded under "Negative downsampling" above, not a separate one.
+`LogisticRegression(C=0.1, solver="lbfgs", max_iter=1000, random_state=42)`, generated
+2026-08-26T12:21:24Z, total ablation runtime 2,521.6s.
+
+| variant | fields dropped | AUC | ΔAUC vs. full field set | log loss | ECE |
+|---|---|---:|---:|---:|---:|
+| full field set (`full_field_set`) | none | 0.9299 | -- | 0.0045260 | 0.000346 |
+| drop `ipinyouid` (`drop_ipinyouid`) | `ipinyouid` | 0.9299 | -0.0000 (negligible) | 0.0045282 | 0.000353 |
+| drop identity fields (`drop_identity_fields`) | `ipinyouid`, `useragent`, `IP` | 0.9248 | -0.0051 | 0.0045411 | 0.000357 |
+| drop all high-cardinality fields (`drop_all_high_cardinality`) | `domain`, `url`, `slotid`, `creative`, `useragent`, `IP`, `ipinyouid` | 0.8962 | -0.0337 | 0.0047177 | 0.000378 |
+
+(All rows evaluated on `season2_val`, 1,745,722 rows / 1,392 positives, matching the val split
+used throughout "Results" above; AUC to 4 decimals, log loss to 7, ECE to 6 -- the same precision
+convention used in the C-sweep table above.)
+
+**Baseline-reproduction gate.** The ablation harness gates variant 1 (`full_field_set`, i.e. the
+same feature set as the reported baseline) against the recorded baseline before the rest of the
+table is trusted to mean anything: `atol=0.0005` on both AUC and log loss, and it passes.
+**Variant 1 reproduces the reported baseline of 0.9299 exactly** (full float precision:
+0.9299001459721288 for both; log loss 0.0045260263881042925 vs. the baseline's recorded
+0.004526) -- this full-scale table, unlike the sampled one, is directly on-distribution with the
+`C=0.1` baseline reported in "Results" and the C-sweep above.
+
+Removing user/device identity fields (`ipinyouid`, `useragent`, `IP`) changes AUC by **0.0051**
+at full scale -- small, and still consistent with ruling out "the model is just memorizing which
+user/device clicked" as the driver (dropping `ipinyouid` alone moves AUC by essentially nothing,
+0.0000). Removing **all** high-cardinality fields (including placement/campaign identifiers
+`domain`, `slotid`, `creative`, `url`) costs **0.0337 AUC** at full scale -- a real but moderate
+cost, well under half of the ~0.07 the superseded sampled run suggested (the gap between the two
+is the combined effect of the smaller sample and the different `C`, not evidence the full-scale
+finding is somehow weaker). This isolates the signal to **placement/campaign-level heterogeneity**
+(some ad slots, creatives, and domains have structurally different baseline CTR), not
+user-identity leakage. The 0.0337 figure is also consistent with the separate "Placement-overlap
+analysis: seen vs. unseen `(domain, slotid, creative)` triples" section below, which finds that
+the model's discrimination does **not** depend on having memorized any single specific placement
+triple (the unseen-placement bucket ranks at least as well as, and under the model-matching
+definition significantly better than, the seen bucket) -- together the two analyses point the same
+way: the high-cardinality placement fields carry a moderate, real share of AUC (0.0337) via
+aggregate category-level heterogeneity across placements, not via memorizing individual triples.
 
 **2. Per-category CTR check** (train split, `creative`/`slotid`/`domain`, categories with >500
 rows): the highest observed category-level CTR was ~3.7% (`slotid`), ~2.5% (`domain`), and ~1.4%
@@ -198,9 +239,9 @@ rows): the highest observed category-level CTR was ~3.7% (`slotid`), ~2.5% (`dom
 degenerate/near-perfectly-separating column.
 
 **Conclusion:** no leakage found. The AUC is legitimately driven by real placement/campaign
-heterogeneity: the ablation above shows removing high-cardinality placement fields
-(`domain`/`slotid`/`creative`/`url`/etc.) costs ~0.07 AUC while removing identity-ish fields
-(`ipinyouid`/`useragent`/`IP`) costs <0.003, and the per-category CTR check found no
+heterogeneity: the full-scale ablation above shows removing high-cardinality placement fields
+(`domain`/`slotid`/`creative`/`url`/etc.) costs 0.0337 AUC while removing identity-ish fields
+(`ipinyouid`/`useragent`/`IP`) costs a smaller 0.0051 AUC, and the per-category CTR check found no
 near-deterministic column (highest observed category CTR ~3.7%, far from 100%). This is this
 repo's own evidence, not an external benchmark comparison -- no claim is made here about how this
 number compares to other iPinYou-based results elsewhere.
@@ -416,6 +457,151 @@ ratio view, not just ECE, before its output is trusted as a probability multipli
 
 ---
 
+## Post-hoc isotonic recalibration
+
+The multiplicative miscalibration surfaced immediately above (bins 3-5 over-predicting 2-4x, bins
+1 and 10 under-predicting) motivates a second calibration stage on top of the LR baseline. This
+section fits `sklearn.isotonic.IsotonicRegression` **on validation only**, applies it **once** to
+test, and reports the effect -- pure post-hoc recalibration, no change to the underlying LR model,
+features, or the negative-downsampling correction already documented above.
+
+**This composes after downsampling recalibration; it does not replace it.** The isotonic
+calibrator is fit on, and applied to, the **`p_calibrated`** column -- i.e. the LR baseline's raw
+output *after* `downsample.recalibrate_probability(p_raw, rate=0.02)` has already been applied
+(see "Negative downsampling" above) -- never on `p_raw` directly. The intended composed transform
+for any future caller (e.g. a bidding simulator) is therefore
+
+```
+p_raw -> recalibrate_probability(p_raw, rate=0.02) -> p_calibrated -> isotonic_calibrator.predict(p_calibrated) -> p_isotonic
+```
+
+both stages required, in that order; skipping the downsampling correction and feeding `p_raw`
+straight into the isotonic calibrator would be wrong, since the calibrator was never fit on that
+scale.
+
+**Fit/apply discipline.** `backend/src/modeling/calibrate_isotonic.py` fits
+`IsotonicRegression(out_of_bounds="clip", increasing=True)` via `.fit(p_val_calibrated, y_val)` --
+validation only, test never enters the fit -- then transforms the already-persisted test
+predictions through the fitted calibrator and scores them **exactly once**, purely for this
+report; no threshold, knot count, or calibration method was selected by looking at test.
+`increasing=True` because the underlying LR model already ranks correctly (AUC ~0.92-0.93) and
+isotonic regression is being used here to fix magnitude, not to re-rank.
+
+**Validation per-row predictions did not exist before this task and were regenerated, not
+refit.** No persisted val-prediction parquet existed prior to this work (only pooled val summary
+metrics did, in `ctr_lr_test_evaluation_season2.json`). `backend/src/modeling/score_val.py` (new)
+closes that gap by loading the already-fitted LR artifact (`ctr_lr_baseline_season2.joblib`) and
+the saved `StandardScaler` and running one forward pass over season-2 val -- it fits nothing. Its
+pooled AUC/log loss are asserted, at runtime, to reproduce the `val_selection_metrics` already
+recorded for the selected `C=0.1` model in `ctr_lr_test_evaluation_season2.json` to within `1e-9`;
+the assertion passed. The resulting `backend/data/predictions/ctr_lr_baseline_season2_val.parquet`
+is what the isotonic calibrator is actually fit against.
+
+### Before / after metrics (test, single touch)
+
+| stage | AUC | log loss | ECE (10 quantile bins) |
+|---|---:|---:|---:|
+| before isotonic (`p_calibrated`) | 0.9228246833 | 0.0048598082 | 0.0003517860 |
+| after isotonic (`p_isotonic`) | 0.9226000297 | 0.0045612789 | 0.0000349450 |
+| delta (after - before) | -0.0002246536 | -0.0002985293 | -0.0003168410 |
+
+ECE improves by roughly **10x** (0.0003517860 -> 0.0000349450, i.e. the row-count-weighted average
+*absolute* calibration gap shrinks by a factor of ~10.07), and log loss improves modestly (~6.1%
+relative, 0.0048598082 -> 0.0045612789) -- consistent with a calibrator that is correcting the
+*shape* of the probability distribution (which log loss and ECE are both sensitive to) without
+adding ranking information (which AUC would need). AUC decreases very slightly, by **0.0002246536**
+-- see below.
+
+**Why AUC drops slightly despite a monotone (`increasing=True`) transform.** A strictly monotone
+transform of `p_calibrated` cannot change the *rank order* of predictions, so in principle it
+should leave AUC exactly unchanged. The small observed drop is attributed here to **tie-breaking**:
+`IsotonicRegression` produces a piecewise-constant (step) function, and step functions map many
+distinct input values onto the same output value -- the original independent-`qcut` `decile_table_after`
+already showed this concretely (only 8 realized quantile bins on `p_isotonic` vs. 10 on
+`p_calibrated`, i.e. the isotonic output is measurably more concentrated/tied). `roc_auc_score`
+credits a tied pair (one positive, one negative, sharing the same predicted score) as "half correct"
+(weight 0.5) rather than fully correct, so collapsing previously-distinct scores into ties can only
+ever cost AUC, never gain it, for pairs that straddle a newly-created tie. This is offered as a
+**reasoned attribution consistent with the observed bin collapse**, not something separately
+proven here -- no experiment isolating tie-pairs and re-scoring them individually was run, so treat
+this as the most plausible explanation rather than a verified mechanism.
+
+### Matched-edge decile table
+
+The calibrator metadata (`backend/data/metadata/ctr_lr_isotonic_calibrator_season2.json`) already
+recorded independent before/after decile tables (`decile_table_before`, `decile_table_after`,
+unchanged, still present), but each was built from its own `qcut` of its own column -- since
+isotonic's step output collapsed to 8 realized bins vs. 10 for `p_calibrated`, bin *i* of one table
+and bin *i* of the other are not the same rows, so a per-bin before/after delta was not directly
+readable. The table below (`decile_table_before_matched_edges` /
+`decile_table_after_matched_edges` in the same JSON, added alongside -- not replacing -- the
+originals) fixes this: bin edges are derived **once**, from `p_calibrated` (before) 10-quantile
+`qcut` on test, and that same row->bin assignment is reused unchanged to aggregate `p_isotonic`
+(after). Because bin membership is identical by construction, **`n` and `observed_click_rate` are
+identical across the before/after columns for a given bin** -- that is the point of matched edges,
+not a data error, and only `mean_predicted` and the pred/obs ratio can differ between the two
+sides.
+
+| bin | edge range (`p_calibrated`, before) | n | mean pred before | mean pred after | observed click rate | n_pos | pred/obs before | pred/obs after |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2.51e-07 -- 5.53e-05 | 165,734 | 0.0000294 | 0.0000259 | 0.0000422 | 7 | 0.6956 | 0.6126 |
+| 2 | 5.53e-05 -- 1.06e-04 | 165,734 | 0.0000804 | 0.0000338 | 0.0000603 | 10 | 1.3331 | 0.5598 |
+| 3 | 1.06e-04 -- 1.60e-04 | 165,735 | 0.0001327 | 0.0000565 | 0.0000664 | 11 | 2.0000 | 0.8514 |
+| 4 | 1.60e-04 -- 2.23e-04 | 165,732 | 0.0001905 | 0.0000681 | 0.0000483 | 8 | 3.9471 | 1.4102 |
+| 5 | 2.23e-04 -- 3.02e-04 | 165,734 | 0.0002612 | 0.0000856 | 0.0000845 | 14 | 3.0924 | 1.0137 |
+| 6 | 3.02e-04 -- 3.99e-04 | 165,734 | 0.0003487 | 0.0001432 | 0.0002112 | 35 | 1.6514 | 0.6780 |
+| 7 | 3.99e-04 -- 5.32e-04 | 165,733 | 0.0004616 | 0.0001807 | 0.0002233 | 37 | 2.0677 | 0.8096 |
+| 8 | 5.32e-04 -- 7.37e-04 | 165,734 | 0.0006258 | 0.0003424 | 0.0003500 | 58 | 1.7881 | 0.9783 |
+| 9 | 7.37e-04 -- 1.16e-03 | 165,734 | 0.0009138 | 0.0007321 | 0.0005973 | 99 | 1.5298 | 1.2255 |
+| 10 | 1.16e-03 -- 9.998e-01 | 165,734 | 0.0044455 | 0.0066727 | 0.0065768 | 1,090 | 0.6759 | 1.0146 |
+
+`n` and `observed click rate` do not move between the "before" and "after" reading of a given bin
+-- by construction, both columns are aggregated over the exact same 165,73x rows per bin, so any
+apparent change would be a bug, not a finding; only the mean-predicted and ratio columns are
+meaningful before/after comparisons here.
+
+**Reading the ratio columns.** The bins the Results/relative-calibration sections already flagged
+as most miscalibrated move markedly toward 1.0: bin 4 (was the worst over-prediction, 3.95x) drops
+to 1.41x; bin 5 (3.09x) drops to 1.01x; bin 3 (2.00x) drops to 0.85x; bin 10, the highest-probability
+decile and the one carrying the vast majority of test positives (1,090 of 1,369), moves from
+under-predicting at 0.68x to 1.01x. Averaged across all 10 bins, mean absolute deviation of the
+ratio from 1.0 falls from **~1.00 to ~0.22** -- roughly a 4.6x tightening in aggregate. **Bins 1 and
+2 are the exception**: they move from mild miscalibration (0.70x, 1.33x) to more pronounced
+under-prediction (0.61x, 0.56x) -- i.e. slightly *worse* in ratio terms after calibration. These are
+also the two smallest-count-of-positives bins (7 and 10 positive rows respectively, the lowest of
+any bin in the table), so their ratios were already the noisiest inputs to begin with, and the
+isotonic fit -- driven by validation, not this specific test slice -- is not guaranteed to improve
+every bin uniformly; it is fit to minimize a global objective on val, not to flatten every test
+decile individually. This is reported plainly rather than smoothed over: the calibrator is a clear
+net improvement (ECE ~10x better, log loss modestly better, 8 of 10 bins' ratios closer to 1.0) but
+not a uniform one.
+
+### Scope and provenance
+
+- **Fit split: validation only, applied once.** `IsotonicRegression.fit(p_val_calibrated, y_val)`
+  uses `backend/data/predictions/ctr_lr_baseline_season2_val.parquet` (1,745,722 rows, 1,392
+  positives) exclusively. Test (`ctr_lr_baseline_season2_test.parquet`, 1,657,338 rows, 1,369
+  positives) is transformed through the already-fitted calibrator and scored exactly once; no
+  test-set information influenced fitting, knot placement, or the choice to use isotonic regression
+  in the first place.
+- **Artifacts:** fitted calibrator ->
+  `backend/data/models/ctr_lr_baseline_season2_isotonic_calibrator.joblib` (a dict: the fitted
+  `IsotonicRegression`, its params, `input_column="p_calibrated"`, the source LR model path, and
+  the val split it was fit on); full metrics/decile-table record ->
+  `backend/data/metadata/ctr_lr_isotonic_calibrator_season2.json`. Script:
+  `backend/src/modeling/calibrate_isotonic.py` (fits the calibrator, produces both decile-table
+  variants); `backend/src/modeling/score_val.py` (regenerates the val per-row predictions this
+  section's fit depends on, described above).
+- **No simulator loads this today.** No `backend/src/simulator/` module (or equivalent) exists in
+  this repository yet -- the fitted calibrator and its metadata are persisted and ready, but
+  nothing currently reads `ctr_lr_baseline_season2_isotonic_calibrator.joblib` at runtime. Whoever
+  builds the auction/bidding simulator next should wire in the two-stage composition documented
+  above (`recalibrate_probability(p_raw, rate=0.02)` then `calibrator.predict(p_calibrated)`), not
+  just the downsampling correction alone, and should use `p_isotonic` (not `p_calibrated`) as the
+  final probability handed to the bidding function once that wiring exists.
+
+---
+
 ## A reproducibility bug found and fixed
 
 While producing the numbers above, re-running the full pipeline twice with an identical seed
@@ -558,10 +744,10 @@ finding:
    verified: `domain`/`slotid`/`creative` are hashed into a shared `2**18`-bucket space alongside 11
    other fields (`features_lr.py`), and ranking for a given row also draws on `region`, `city`,
    `adexchange`, `advertiser`, `hour`, and `usertag` tokens that are typically shared between seen
-   and unseen placements -- consistent with the "Leakage investigation" ablation above, which found
-   that removing all high-cardinality placement fields costs ~0.07 AUC in aggregate, i.e. most of the
-   model's discrimination does not depend on memorizing any single exact placement triple. This is
-   offered as a plausible explanation, not a demonstrated one.
+   and unseen placements -- consistent with the "Leakage investigation" ablation above (full-scale
+   ablation, `C=0.1`), which found that removing all high-cardinality placement fields costs 0.0337
+   AUC in aggregate, i.e. most of the model's discrimination does not depend on memorizing any single
+   exact placement triple. This is offered as a plausible explanation, not a demonstrated one.
 
 **Sampling variance, quantified (Hanley-McNeil standard errors).** Caveats 1 and 2 above are
 resolved here rather than left qualitative. Standard errors use the Hanley & McNeil (1982)
