@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  background-color: #f8fafc; /* slate-50 */
+  color: #0f172a; /* slate-900 */
+}
+
+/* Quality floor: respect reduced-motion for the few CSS transitions we
+   do use (button hover/focus states). Chart animation is disabled
+   unconditionally in the components themselves (isAnimationActive), so
+   nothing there needs a media-query guard. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Print/projection legibility: force a white background and black text
+   regardless of ambient theme, since figures may be printed. */
+@media print {
+  body {
+    background: #fff;
+    color: #000;
+  }
+}
